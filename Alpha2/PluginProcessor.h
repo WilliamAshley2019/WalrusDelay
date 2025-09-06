@@ -1,0 +1,213 @@
+/*
+  ==============================================================================
+
+    PluginProcessor.h
+    Created: 5 Sep 2025
+
+  ==============================================================================
+*/
+
+#pragma once
+
+#include <JuceHeader.h>
+
+/**
+ * @class WalrusDelay1AudioProcessor
+ * @brief Handles all audio processing and parameter management for the WalrusDelay1 plugin.
+ *
+ * This class implements a tape delay with wow and flutter modulation, a low-pass filter in the feedback loop,
+ * and a proper reverb effect using juce::dsp::Reverb.
+ */
+class WalrusDelay1AudioProcessor : public juce::AudioProcessor
+{
+public:
+    //==============================================================================
+    WalrusDelay1AudioProcessor();
+    ~WalrusDelay1AudioProcessor() override;
+
+    //==============================================================================
+    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+
+#ifndef JucePlugin_PreferredChannelConfigurations
+    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
+#endif
+
+    void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    //==============================================================================
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override;
+
+    //==============================================================================
+    const juce::String getName() const override;
+    bool acceptsMidi() const override;
+    bool producesMidi() const override;
+    bool isMidiEffect() const override;
+    double getTailLengthSeconds() const override;
+
+    //==============================================================================
+    int getNumPrograms() override;
+    int getCurrentProgram() override;
+    void setCurrentProgram(int index) override;
+    const juce::String getProgramName(int index) override;
+    void changeProgramName(int index, const juce::String& newName) override;
+
+    //==============================================================================
+    void getStateInformation(juce::MemoryBlock& destData) override;
+    void setStateInformation(const void* data, int sizeInBytes) override;
+
+    //==============================================================================
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    //==============================================================================
+    // Circular Buffer for Delay Line
+    template <typename T>
+    class CircularBuffer
+    {
+    public:
+        CircularBuffer() {}
+        ~CircularBuffer() {}
+
+        void flushBuffer() { if (buffer) memset(buffer.get(), 0, bufferLength * sizeof(T)); }
+
+        void createCircularBuffer(unsigned int _bufferLength)
+        {
+            createCircularBufferPowerOfTwo((unsigned int)(pow(2, ceil(log(_bufferLength) / log(2)))));
+        }
+
+        void createCircularBufferPowerOfTwo(unsigned int _bufferLengthPowerOfTwo)
+        {
+            writeIndex = 0;
+            bufferLength = _bufferLengthPowerOfTwo;
+            wrapMask = bufferLength - 1;
+            buffer = std::make_unique<T[]>(bufferLength);
+            flushBuffer();
+        }
+
+        void writeBuffer(T input)
+        {
+            buffer[writeIndex++] = input;
+            writeIndex &= wrapMask;
+        }
+
+        T readBuffer(float delayInSamples)
+        {
+            delayInSamples = juce::jlimit(0.0f, static_cast<float>(bufferLength - 1), delayInSamples);
+            float readIndex = (float)writeIndex - delayInSamples;
+            if (readIndex < 0) readIndex += bufferLength;
+            int readIndexInt = (int)readIndex;
+            float frac = readIndex - readIndexInt;
+            int readIndexNext = (readIndexInt + 1) & wrapMask;
+            return buffer[readIndexInt] * (1.0f - frac) + buffer[readIndexNext] * frac;
+        }
+
+        unsigned int getBufferLength() { return bufferLength; }
+
+    private:
+        std::unique_ptr<T[]> buffer = nullptr;
+        unsigned int writeIndex = 0;
+        unsigned int bufferLength = 1024;
+        unsigned int wrapMask = bufferLength - 1;
+    };
+
+    // Low-Pass Filter
+    struct LowPassFilter
+    {
+        void prepare(double newSampleRate)
+        {
+            sampleRate = static_cast<float>(newSampleRate);
+            reset();
+            smoothedFreq.reset(sampleRate, 0.01f); // Faster smoothing for responsiveness
+        }
+
+        void reset() { x1 = x2 = y1 = y2 = 0.0f; }
+
+        void update(float frequency)
+        {
+            // Limit frequency to avoid instability near Nyquist
+            frequency = juce::jlimit(20.0f, sampleRate * 0.5f - 10.0f, frequency);
+            if (frequency != smoothedFreq.getTargetValue())
+            {
+                smoothedFreq.setTargetValue(frequency);
+                float freq = smoothedFreq.getNextValue();
+                float omega = 2.0f * juce::MathConstants<float>::pi * freq / sampleRate;
+                float tanHalfOmega = tan(omega / 2.0f); // Use tan for stable high-frequency response
+                float Q = 0.707f; // Butterworth-like response for smoother filtering
+                float denom = 1.0f + tanHalfOmega / Q + tanHalfOmega * tanHalfOmega;
+
+                b0 = (tanHalfOmega * tanHalfOmega) / denom;
+                b1 = 2.0f * b0;
+                b2 = b0;
+                a1 = 2.0f * (tanHalfOmega * tanHalfOmega - 1.0f) / denom;
+                a2 = (1.0f - tanHalfOmega / Q + tanHalfOmega * tanHalfOmega) / denom;
+                a0 = 1.0f; // Normalize to ensure unity gain at DC
+            }
+        }
+
+        float process(float input)
+        {
+            float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1;
+            x1 = input;
+            y2 = y1;
+            y1 = output;
+            return juce::jlimit(-1.0f, 1.0f, output);
+        }
+
+        float sampleRate = 44100.0f;
+        float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+        float a0 = 1.0f, a1 = 0.0f, a2 = 0.0f, b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
+        juce::LinearSmoothedValue<float> smoothedFreq{ 2000.0f };
+    };
+
+    // Parameter Layout
+    juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    // DSP Members
+    std::array<CircularBuffer<float>, 2> delayBuffers; // One per channel
+    std::array<LowPassFilter, 2> feedbackFilters; // Low-pass filters for feedback
+    int maxDelaySamples{ 0 };
+
+    // LFOs for Wow & Flutter modulation
+    juce::dsp::Oscillator<float> wowOscillator{ [](float x) { return std::sin(x); } };
+    juce::dsp::Oscillator<float> flutterOscillator{ [](float x) { return std::sin(x); } };
+    float wowPhaseLeft{ 0.0f }, wowPhaseRight{ 0.0f };
+    float flutterPhaseLeft{ 0.0f }, flutterPhaseRight{ 0.0f };
+
+    // Reverb
+    juce::dsp::Reverb reverb;
+    juce::dsp::Reverb::Parameters reverbParams;
+
+    // Parameter pointers
+    juce::AudioParameterFloat* delayTimeParam;
+    juce::AudioParameterFloat* feedbackParam;
+    juce::AudioParameterFloat* wowRateParam;
+    juce::AudioParameterFloat* wowDepthParam;
+    juce::AudioParameterFloat* flutterRateParam;
+    juce::AudioParameterFloat* flutterDepthParam;
+    juce::AudioParameterFloat* dryWetParam;
+    juce::AudioParameterFloat* reverbSizeParam;
+    juce::AudioParameterFloat* reverbDampParam;
+    juce::AudioParameterFloat* reverbWidthParam;
+    juce::AudioParameterFloat* reverbMixParam;
+    juce::AudioParameterBool* reverbFreezeParam;
+    juce::AudioParameterFloat* filterFreqParam;
+
+    // Smoothing
+    std::array<juce::LinearSmoothedValue<float>, 2> smoothedDelayTime; // Per channel for stereo
+    juce::LinearSmoothedValue<float> smoothedFeedback{ 0.5f };
+    juce::LinearSmoothedValue<float> smoothedDryWet{ 0.5f };
+    juce::LinearSmoothedValue<float> smoothedReverbMix{ 0.0f };
+
+    // Fade-out for feedback
+    std::array<juce::LinearSmoothedValue<float>, 2> feedbackFade; // Per channel
+    std::array<int, 2> silenceCounter; // Count silent samples to trigger fade
+
+    // Temporary buffer for delay output
+    juce::AudioBuffer<float> delayOutput;
+
+    //==============================================================================
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WalrusDelay1AudioProcessor)
+};
